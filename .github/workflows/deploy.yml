@@ -1,0 +1,94 @@
+name: Deploy to S3
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - run: npm install --global npm@12.2.1
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: site
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ap-northeast-1
+      AWS_PAGER: ''
+      S3_PREFIX: 'stamprecord/'
+      CLOUDFRONT_DISTRIBUTION_ID: E11RMRSHLGVPYB
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: site
+          path: dist/
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: arn:aws:iam::723484802208:role/github-deploy-stamprecord_page
+          aws-region: ap-northeast-1
+          allowed-account-ids: '723484802208'
+      - name: Upload assets, then publish HTML
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s dist/index.html
+          # The root site shares this bucket with every other page.
+          # Reject unexpected top-level paths and never delete S3 objects.
+          if [[ -z "$S3_PREFIX" ]]; then
+            while IFS= read -r -d '' entry; do
+              case "$(basename "$entry")" in
+                index.html|favicon.ico|assets|images|js) ;;
+                *) echo "Unexpected root output: $entry" >&2; exit 1 ;;
+              esac
+            done < <(find dist -mindepth 1 -maxdepth 1 -print0)
+          fi
+          destination="s3://kyome.io/${S3_PREFIX}"
+          if [[ -d dist/assets ]]; then
+            aws s3 cp dist/assets/ "${destination}assets/" --recursive \
+              --cache-control 'public,max-age=31536000,immutable' --only-show-errors
+          fi
+          aws s3 cp dist/ "$destination" --recursive \
+            --exclude 'assets/*' --exclude 'index.html' \
+            --cache-control 'no-cache' --only-show-errors
+          aws s3 cp dist/index.html "${destination}index.html" \
+            --cache-control 'no-cache' --content-type 'text/html; charset=utf-8' --only-show-errors
+      - name: Refresh CloudFront cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "$S3_PREFIX" ]]; then
+            paths=( '/' '/?*' '/index.html*' '/favicon.ico*' '/images/*' '/js/*' '/assets/*' )
+          else
+            page="/${S3_PREFIX%/}"
+            paths=( "$page" "$page?*" "$page/*" )
+          fi
+          invalidation=$(aws cloudfront create-invalidation \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" \
+            --paths "${paths[@]}" --query Invalidation.Id --output text)
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$CLOUDFRONT_DISTRIBUTION_ID" --id "$invalidation"
